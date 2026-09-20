@@ -10,6 +10,7 @@ allow/deny 重叠或非法标识、非法快照/锁/根包/多余字段）与既
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -371,6 +372,37 @@ def test_with_expression_422():
     r = policy(repo, {"app": "1.0", "bad": "1.0"})
     assert r.status_code == 422
     assert "WITH" in r.json()["message"]
+
+
+@pytest.mark.parametrize("expression,operator", [
+    ("MIT OR(Apache-2.0)", "OR"),
+    ("(MIT)AND(Apache-2.0)", "AND"),
+    ("MIT oR(Apache-2.0)", "oR"),
+    ("(MIT)aNd(Apache-2.0)", "aNd"),
+])
+def test_operator_without_whitespace_boundary_422(expression, operator):
+    """AND/OR 任一缺左/右空白即 422，并定位到包、版本与违规运算符。"""
+    repo = {
+        "app": [c("1.0", [d("bad")])],
+        "bad": [c("1.0", license_=expression)],
+    }
+    r = policy(repo, {"app": "1.0", "bad": "1.0"})
+    assert r.status_code == 422
+    message = r.json()["message"]
+    assert "bad==1.0" in message
+    assert repr(operator) in message
+    assert "空白" in message
+
+
+def test_well_spaced_parenthesised_expression_still_evaluates():
+    """运算符与括号之间留有空白时，嵌套括号表达式仍按原语义求值。"""
+    repo = {
+        "app": [c("1.0", [d("x")])],
+        "x": [c("1.0", license_="(MIT) AND (Apache-2.0)")],
+    }
+    body = report(repo, {"app": "1.0", "x": "1.0"})
+    assert names(body, "violations") == []
+    assert names(body, "unknowns") == ["app"]
 
 
 def test_policy_overlap_422():

@@ -25,10 +25,12 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 （Package URL）、依赖名称及候选版本随快照携带的 `source_url` / `sha256`
 / `license` 元数据；元数据缺失只形成 `warnings`，不阻断导出。
 `/license-policy` 也**先审计 `current_lock`**，锁有效时解析各可达包锁定
-版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**，按请求的
+版本 `metadata.license` 的 **SPDX `AND`/`OR`/括号表达式**（`AND`/`OR`
+大小写不敏感但**两侧必须各以空白分隔**，如 `MIT OR(Apache-2.0)`、
+`(MIT)AND(Apache-2.0)` 属非法），按请求的
 `allow` / `deny` 标识集合做**三态判定**（允许 / 拒绝 / 未知），返回按包名
 排序的 `violations` 与 `unknowns`，每项附根包到该包的**全部最短路径**；
-非法 SPDX 表达式或 allow/deny 规则重叠返回 422。
+非法 SPDX 表达式（含运算符缺空白）或 allow/deny 规则重叠返回 422。
 `/lock-diff` 在**同一份仓库快照与同一目标环境**下提交 `before_lock` 与
 `after_lock` 两份锁定清单：两份锁**各自独立复用 `/audit-lock` 的同一套
 规则**校验，任一无效即整体 **409** 并分别标注 before/after 的审计问题；
@@ -1241,8 +1243,16 @@ curl -s -X POST http://localhost:8000/sbom \
    - 提供文本：先按 **SPDX 表达式**解析（`AND` / `OR` / 括号，
      `OR` 优先级最低、`AND` 更高；`AND`/`OR` 大小写不敏感，标识词
      大小写敏感），再按三态规则求值；
-   - 许可证文本不是合法的 SPDX 表达式（含不支持的 `WITH` 例外表达式）
-     时返回 **422**，错误信息定位到包与版本；
+   - **空白边界（SPDX 词法）**：`AND`/`OR` 的**左右两侧都必须以空白
+     分隔**（空格、制表符或换行均可）。`MIT OR (Apache-2.0)`、
+     `(MIT) AND (Apache-2.0)`、`(MIT)` 合法；而 `MIT OR(Apache-2.0)`
+     （右侧紧贴 `(`）、`(MIT)AND(Apache-2.0)`（左侧紧贴 `)`）等
+     贴连写法会被拒绝，错误信息定位到具体运算符与其缺失空白的一侧；
+     标识词中的字母片段（如 `MirOS` 中的 `OR`、`Stanford-AND-Style`
+     中的 `AND`）不是运算符，仍按标识词原义处理；
+   - 许可证文本不是合法的 SPDX 表达式（含 `AND`/`OR` 缺少空白分隔、
+     不支持的 `WITH` 例外表达式）时返回 **422**，错误信息定位到包、
+     版本与违规运算符；
 3. 每个包的判定结果为**三态**之一：
 
    | 原子标识 / 表达式 | 结果 |
@@ -1307,6 +1317,19 @@ curl -s -X POST http://localhost:8000/license-policy \
 }
 ```
 
+运算符缺少空白分隔时返回 **422**，错误信息同时定位到包、版本与违规
+运算符，例如包 `bad 1.0` 的许可证写作 `MIT OR(Apache-2.0)`：
+
+```json
+{
+  "status": "invalid_snapshot",
+  "message": "包 bad==1.0 的许可证表达式 'MIT OR(Apache-2.0)' 不是合法的 SPDX 表达式: 位置 4 处的运算符 'OR' 与其右侧字符 '(' 之间缺少空白：SPDX 语法要求 AND/OR 两侧均以空白分隔（应写作 '… OR …'，而非 …OR( 的贴连形式）"
+}
+```
+
+合法写法是 `MIT OR (Apache-2.0)`（运算符与括号之间留空白）；
+`(MIT)AND(Apache-2.0)` 同理应写作 `(MIT) AND (Apache-2.0)`。
+
 确定性与遍历细节：
 
 - 许可证只读取**锁定版本**候选的 `metadata.license`；同一包未被锁定的
@@ -1327,7 +1350,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | --- | --- |
 | `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定 |
-| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `AND`/`OR` 两侧缺少空白分隔、`WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
 ### `POST /lock-diff`
 
@@ -1697,7 +1720,10 @@ curl -s -X POST http://localhost:8000/explain-version \
     返回 409 且不判定；锁有效时在第 11 条的已激活依赖图上逐包读取锁定
     版本的 `metadata.license`：未提供归为未知（不阻断），提供则解析
     SPDX `AND`/`OR`/括号表达式（`OR` 低于 `AND`，括号分组；关键字大小
-    写不敏感、标识大小写敏感），按 allow/deny 两个标识集合做三态求值——
+    写不敏感、标识大小写敏感；`AND`/`OR` 两侧必须各以空白分隔，
+    `MIT OR(Apache-2.0)`、`(MIT)AND(Apache-2.0)` 等贴连写法在词法层
+    拒绝并定位违规运算符，标识词内的 AND/OR 字母片段不受影响），按
+    allow/deny 两个标识集合做三态求值——
     标识在 deny 中为拒绝、仅在 allow 中为允许、其余未知；`AND` 全部允许
     才通过、任一拒绝即违规；`OR` 任一允许即通过、全部拒绝才违规、其余
     未知。`violations` 与 `unknowns` 各自按包名排序，每项复用

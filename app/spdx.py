@@ -10,8 +10,9 @@
   引用 ``LicenseRef-<idstring>``（可带 ``DocumentRef-<idstring>:`` 前缀）；
   标识词**大小写敏感、按字面匹配**；
 * ``AND`` / ``OR`` 是保留字，**大小写不敏感**，两侧必须是完整标识词或
-  括号组，且必须以空白分隔（SPDX 语法）；``OR`` 优先级最低，``AND``
-  更高，括号分组；
+  括号组，且**两侧必须各以空白分隔**（SPDX 语法）：``MIT OR (Apache-2.0)``
+  合法，而 ``MIT OR(Apache-2.0)``、``(MIT)AND(Apache-2.0)`` 非法；
+  ``OR`` 优先级最低，``AND`` 更高，括号分组；
 * 不支持 ``WITH`` 例外表达式（如
   ``GPL-2.0-only WITH Classpath-exception-2.0``），出现即按非法表达式
   处理（API 层映射为 422）。
@@ -59,8 +60,39 @@ class LicenseExpressionError(ValueError):
     """许可证表达式不是合法的 SPDX AND/OR/括号表达式。"""
 
 
+def _check_operator_spacing(text: str, word: str, start: int, end: int) -> None:
+    """校验 AND/OR 词两侧均为空白；缺任一侧时抛 LicenseExpressionError。
+
+    SPDX 语法要求 AND/OR 两侧以空白分隔，因此 ``MIT OR(Apache-2.0)``
+    （右侧贴 '('）与 ``(MIT)AND(Apache-2.0)``（左侧贴 ')'）均非法。
+    出现在表达式首尾的运算符不报空白错误（``start == 0`` 时无左侧、
+    ``end == n`` 时无右侧），交由语法层以“缺少操作数”的错误处理，
+    避免给出误导信息。
+    """
+    if start > 0 and not text[start - 1].isspace():
+        raise LicenseExpressionError(
+            f"位置 {start} 处的运算符 {word!r} 与其左侧字符 {text[start - 1]!r}"
+            " 之间缺少空白：SPDX 语法要求 AND/OR 两侧均以空白分隔"
+            f"（应写作 '… {word.upper()} …'，而非 "
+            f"{text[start - 1]}{word}… 的贴连形式）"
+        )
+    if end < len(text) and not text[end].isspace():
+        raise LicenseExpressionError(
+            f"位置 {start} 处的运算符 {word!r} 与其右侧字符 {text[end]!r}"
+            " 之间缺少空白：SPDX 语法要求 AND/OR 两侧均以空白分隔"
+            f"（应写作 '… {word.upper()} …'，而非 "
+            f"…{word}{text[end]} 的贴连形式）"
+        )
+
+
 def _tokenize(text: str) -> list[str]:
-    """把表达式文本切为记号；无法识别的字符抛 LicenseExpressionError。"""
+    """把表达式文本切为记号；无法识别的字符抛 LicenseExpressionError。
+
+    扫描期同步强制 SPDX 词法：与 AND/OR（大小写不敏感）逐字相同的词，
+    其左右相邻字符都必须是空白，否则立即报错并定位到该运算符。许可证
+    标识词内的字母片段（如 ``MirOS`` 中的 ``OR``、``Stanford`` 中的
+    ``AND``）不会被当作运算符，语义不变。
+    """
     tokens: list[str] = []
     i, n = 0, len(text)
     while i < n:
@@ -77,7 +109,10 @@ def _tokenize(text: str) -> list[str]:
                     f"位置 {i} 处存在无法识别的字符 {ch!r}；SPDX 表达式只允许"
                     " 许可证标识、括号与空白分隔的 AND/OR"
                 )
-            tokens.append(match.group(0))
+            word = match.group(0)
+            if word.upper() in ("AND", "OR"):
+                _check_operator_spacing(text, word, i, match.end())
+            tokens.append(word)
             i = match.end()
     return tokens
 

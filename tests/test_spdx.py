@@ -162,6 +162,78 @@ def test_redundant_parentheses_around_atom():
 
 
 # --------------------------------------------------------------------- #
+# 4b. AND/OR 两侧必须以空白分隔（SPDX 词法边界）
+# --------------------------------------------------------------------- #
+@pytest.mark.parametrize("expr", [
+    "MIT OR(Apache-2.0)",       # 运算符右侧紧贴 '('
+    "MIT AND(Apache-2.0)",
+    "(MIT)AND(Apache-2.0)",     # 运算符左侧紧贴 ')'
+    "(MIT)OR(Apache-2.0)",
+    "MIT OR(Apache-2.0) AND BSD-3-Clause",
+    "(MIT)AND(Apache-2.0) OR BSD-3-Clause",
+    "MIT oR(Apache-2.0)",       # 大小写不敏感的运算符同样受约束
+    "(MIT)aNd(Apache-2.0)",
+    "MIT OR( Apache-2.0 )",     # 括号内有空白不弥补括号外侧的贴连
+    "( MIT )AND(Apache-2.0)",
+    "(MIT OR Apache-2.0)AND(MIT)",  # 嵌套括号组与运算符贴连
+    "MIT\tAND(Apache-2.0)",     # 左侧是 tab、右侧贴 '('：右侧仍缺空白
+])
+def test_operator_without_surrounding_whitespace_rejected(expr):
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError, match="空白"):
+        parse_spdx_expression(expr)
+
+
+@pytest.mark.parametrize("expr,operator", [
+    ("MIT OR(Apache-2.0)", "OR"),
+    ("(MIT)AND(Apache-2.0)", "AND"),
+    ("MIT oR(Apache-2.0)", "oR"),
+    ("(MIT)aNd(Apache-2.0)", "aNd"),
+])
+def test_spacing_error_locates_the_offending_operator(expr, operator):
+    """错误信息必须指出具体违规运算符（保留原文大小写）。"""
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError) as excinfo:
+        parse_spdx_expression(expr)
+    assert repr(operator) in str(excinfo.value)
+
+
+def test_spacing_error_reports_left_and_right_side_distinctly():
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError, match="左侧"):
+        parse_spdx_expression("(MIT)AND(Apache-2.0)")
+    with pytest.raises(LicenseExpressionError, match="右侧"):
+        parse_spdx_expression("MIT OR(Apache-2.0)")
+
+
+@pytest.mark.parametrize("expr", [
+    "MIT OR (Apache-2.0)",       # 运算符与括号之间有空白：合法
+    "(MIT) AND (Apache-2.0)",
+    "(MIT) and (Apache-2.0)",    # 大小写不敏感运算符 + 空白：合法
+    "(((MIT)))",                 # 括号与标识词贴连不需要空白
+    "(MIT)",
+    "MIT  OR  Apache-2.0",       # 多空白
+    "MIT\tOR\tApache-2.0",       # tab 是合法分隔空白
+    "MIT AND\t(Apache-2.0)",     # tab 作为右侧空白同样合法
+    "MIT\nOR\nApache-2.0",       # 换行也是合法分隔空白
+    "((MIT OR GPL-3.0-only) AND (Apache-2.0 OR Weird))",  # 嵌套
+    "(MIT OR Apache-2.0) AND (BSD-3-Clause)",
+])
+def test_well_spaced_expressions_still_parse(expr):
+    parse_spdx_expression(expr)  # 不抛异常即可
+
+
+def test_letter_fragments_of_operators_inside_identifiers_unchanged():
+    """标识词中包含 AND/OR 字母片段时仍按原语义当作原子标识。"""
+    assert verdict("MirOS", {"MirOS"}, set()) == ALLOW
+    assert verdict("Stanford-AND-Style", set(), set()) == UNKNOWN
+    assert verdict("OREX-1.0 OR MIT", PERMISSIVE, set()) == ALLOW
+    assert verdict("MIT OR OreX-1.0", PERMISSIVE, set()) == ALLOW
+    # 贴连括号只对真正的运算符（逐字 AND/OR）报错；标识词不受影响。
+    assert verdict("(MirOS)", {"MirOS"}, set()) == ALLOW
+
+
+# --------------------------------------------------------------------- #
 # 5. 非法表达式
 # --------------------------------------------------------------------- #
 @pytest.mark.parametrize("expr", [
