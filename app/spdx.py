@@ -10,8 +10,11 @@
   引用 ``LicenseRef-<idstring>``（可带 ``DocumentRef-<idstring>:`` 前缀）；
   标识词**大小写敏感、按字面匹配**；
 * ``AND`` / ``OR`` 是保留字，**大小写不敏感**，两侧必须是完整标识词或
-  括号组，且必须以空白分隔（SPDX 语法）；``OR`` 优先级最低，``AND``
-  更高，括号分组；
+  括号组，且**运算符左右两侧都必须以空白分隔**（SPDX 语法）：
+  ``MIT OR(Apache-2.0)``、``(MIT)AND(Apache-2.0)`` 等任一侧紧贴括号或
+  标识词的写法在词法阶段即被拒绝（API 层映射为 422，错误信息定位到
+  运算符及其位置），只有 ``MIT OR (Apache-2.0)``、``(MIT) AND (Apache-2.0)``
+  这样两侧均有空白才合法；``OR`` 优先级最低，``AND`` 更高，括号分组；
 * 不支持 ``WITH`` 例外表达式（如
   ``GPL-2.0-only WITH Classpath-exception-2.0``），出现即按非法表达式
   处理（API 层映射为 422）。
@@ -59,16 +62,57 @@ class LicenseExpressionError(ValueError):
     """许可证表达式不是合法的 SPDX AND/OR/括号表达式。"""
 
 
-def _tokenize(text: str) -> list[str]:
-    """把表达式文本切为记号；无法识别的字符抛 LicenseExpressionError。"""
-    tokens: list[str] = []
+# 运算符保留字：大小写不敏感识别。
+_OPERATOR_WORDS = frozenset(("AND", "OR"))
+
+
+class _Token:
+    """词法记号：文本与它在表达式（strip 后）中的起止位置。"""
+
+    __slots__ = ("text", "start", "end")
+
+    def __init__(self, text: str, start: int, end: int):
+        self.text = text
+        self.start = start
+        self.end = end
+
+
+def _check_operator_whitespace(token: _Token, text: str) -> None:
+    """校验 AND/OR 运算符左右两侧都以空白分隔，否则抛 LicenseExpressionError。
+
+    SPDX 语法要求运算符与两侧的标识词/括号之间各有空白。紧贴左括号
+    （``OR(``）、紧贴右括号（``)AND``）等在词法阶段直接报错并定位运算符；
+    运算符与字母片段紧贴会被扫描器并入相邻记号（``MITAND``、``ORMIT``
+    都不是独立的 AND/OR 记号），由语法层按“非法/相邻标识词”规则报错；
+    位于表达式边界（``OR MIT``、``MIT OR``）的悬空运算符则由语法层的
+    ``_expect_operand`` / ``parse_atom`` 报错。各路径都稳定映射为 422。
+    """
+    missing: list[str] = []
+    n = len(text)
+    if token.start > 0 and not text[token.start - 1].isspace():
+        missing.append("左侧")
+    if token.end < n and not text[token.end].isspace():
+        missing.append("右侧")
+    if not missing:
+        return
+    raise LicenseExpressionError(
+        f"位置 {token.start} 处的运算符 {token.text!r} 缺少"
+        f"{'、'.join(missing)}空白分隔：SPDX 语法要求 AND/OR "
+        "两侧均以空白与标识词或括号分隔（如 'MIT OR Apache-2.0'、"
+        "'(MIT) AND (Apache-2.0)'），不允许 'OR('、')AND' 这类紧贴写法"
+    )
+
+
+def _tokenize(text: str) -> list[_Token]:
+    """把表达式文本切为记号；无法识别的字符或 AND/OR 缺少两侧空白时抛错。"""
+    tokens: list[_Token] = []
     i, n = 0, len(text)
     while i < n:
         ch = text[i]
         if ch.isspace():
             i += 1
         elif ch == "(" or ch == ")":
-            tokens.append(ch)
+            tokens.append(_Token(ch, i, i + 1))
             i += 1
         else:
             match = _TOKEN_RE.match(text, i)
@@ -77,8 +121,13 @@ def _tokenize(text: str) -> list[str]:
                     f"位置 {i} 处存在无法识别的字符 {ch!r}；SPDX 表达式只允许"
                     " 许可证标识、括号与空白分隔的 AND/OR"
                 )
-            tokens.append(match.group(0))
-            i = match.end()
+            start, end = match.start(), match.end()
+            word = match.group(0)
+            token = _Token(word, start, end)
+            if word.upper() in _OPERATOR_WORDS:
+                _check_operator_whitespace(token, text)
+            tokens.append(token)
+            i = end
     return tokens
 
 
@@ -87,23 +136,28 @@ class _Parser:
     and := atom ('AND' atom)*；atom := '(' or ')' | 标识词。
     """
 
-    def __init__(self, tokens: list[str]):
+    def __init__(self, tokens: list[_Token]):
         self._tokens = tokens
         self._pos = 0
 
     def peek(self) -> str | None:
-        return self._tokens[self._pos] if self._pos < len(self._tokens) else None
+        return self._tokens[self._pos].text if self._pos < len(self._tokens) else None
 
     def consume(self) -> str:
-        tok = self._tokens[self._pos]
+        tok = self._tokens[self._pos].text
         self._pos += 1
         return tok
 
+    def _peek_token(self) -> _Token | None:
+        return self._tokens[self._pos] if self._pos < len(self._tokens) else None
+
     def parse_or(self, depth: int) -> tuple:
         left = self.parse_and(depth)
-        while (tok := self.peek()) is not None:
+        while (cur := self._peek_token()) is not None:
+            tok = cur.text
             if tok.upper() == "OR":
                 self.consume()
+                self._expect_operand(cur)
                 left = ("or", left, self.parse_and(depth))
             elif tok.upper() == "WITH":
                 raise LicenseExpressionError(
@@ -116,9 +170,11 @@ class _Parser:
 
     def parse_and(self, depth: int) -> tuple:
         left = self.parse_atom(depth)
-        while (tok := self.peek()) is not None:
+        while (cur := self._peek_token()) is not None:
+            tok = cur.text
             if tok.upper() == "AND":
                 self.consume()
+                self._expect_operand(cur)
                 left = ("and", left, self.parse_atom(depth))
             elif tok.upper() == "WITH":
                 raise LicenseExpressionError(
@@ -128,6 +184,33 @@ class _Parser:
             else:
                 break
         return left
+
+    def _expect_operand(self, operator: _Token) -> None:
+        """校验 AND/OR 右侧确实有标识词或括号组。
+
+        词法阶段已保证运算符与右侧记号之间存在空白（紧贴的 ``OR(`` 等在
+        扫描期被拒绝）；这里拦截右侧缺失（表达式结束）或为右括号/另一个
+        运算符的情形，错误信息定位到该运算符。
+        """
+        nxt = self._peek_token()
+        if nxt is None:
+            raise LicenseExpressionError(
+                f"位置 {operator.start} 处的运算符 {operator.text!r}"
+                " 右侧缺少许可证标识或括号组（表达式提前结束）；"
+                "SPDX 语法要求 AND/OR 两侧均以空白分隔标识词或括号组"
+            )
+        nxt_word = nxt.text
+        if nxt_word == ")":
+            raise LicenseExpressionError(
+                f"位置 {operator.start} 处的运算符 {operator.text!r}"
+                " 右侧缺少许可证标识或括号组（其后直接遇到 ')'）；"
+                "AND/OR 两侧必须是以空白分隔的完整标识词或括号组"
+            )
+        if nxt_word.upper() in ("AND", "OR"):
+            raise LicenseExpressionError(
+                f"位置 {operator.start} 处的运算符 {operator.text!r} "
+                f"右侧出现 {nxt_word!r}：AND/OR 两侧必须是许可证标识或括号组"
+            )
 
     def parse_atom(self, depth: int) -> tuple:
         tok = self.peek()
@@ -152,7 +235,9 @@ class _Parser:
                     " Classpath-exception-2.0'），只允许 AND/OR/括号组合"
                 )
             raise LicenseExpressionError(
-                f"意外的关键字 {tok!r}：AND/OR 两侧必须是许可证标识或括号组"
+                f"位置 {self._tokens[self._pos].start} 处的运算符 {tok!r}"
+                " 左侧缺少许可证标识或括号组：AND/OR 两侧必须是以空白分隔的"
+                "完整标识词或括号组"
             )
         if _SPDX_LEAF_RE.fullmatch(tok) is None:
             raise LicenseExpressionError(

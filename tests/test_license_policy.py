@@ -10,6 +10,7 @@ allow/deny 重叠或非法标识、非法快照/锁/根包/多余字段）与既
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -371,6 +372,53 @@ def test_with_expression_422():
     r = policy(repo, {"app": "1.0", "bad": "1.0"})
     assert r.status_code == 422
     assert "WITH" in r.json()["message"]
+
+
+@pytest.mark.parametrize("license_text,operator", [
+    ("MIT OR(Apache-2.0)", "OR"),         # 右侧缺少空白
+    ("(MIT)AND(Apache-2.0)", "AND"),      # 两侧都缺少空白
+    ("(MIT OR Apache-2.0) and(Apache-2.0)", "and"),
+    ("GPL-3.0-only OR(BSD-3-Clause OR MIT)", "OR"),
+])
+def test_operator_missing_whitespace_returns_422(license_text, operator):
+    """回归：AND/OR 任一侧缺少空白分隔时稳定 422，并定位包与违规运算符。"""
+    repo = {
+        "app": [c("1.0", [d("bad")])],
+        "bad": [c("1.0", license_=license_text)],
+    }
+    r = policy(repo, {"app": "1.0", "bad": "1.0"})
+    assert r.status_code == 422, r.text
+    message = r.json()["message"]
+    assert "bad==1.0" in message
+    assert repr(operator) in message
+    assert "空白" in message
+
+
+def test_whitespace_separated_nested_expression_still_200():
+    """合法形式（空白分隔、大小写混写、嵌套括号）不受影响，优先级不变。"""
+    repo = {
+        "app": [c("1.0", [d("ok1"), d("ok2"), d("no")])],
+        "ok1": [c("1.0", license_="MIT OR (Apache-2.0)")],
+        "ok2": [c("1.0", license_="(MIT) aNd (Apache-2.0)")],
+        # (allow OR deny) AND allow -> allow：括号仍正确改变优先级
+        "no": [c("1.0",
+                 license_="(MIT OR GPL-3.0-only) AND Apache-2.0")],
+    }
+    lock = {"app": "1.0", "ok1": "1.0", "ok2": "1.0", "no": "1.0"}
+    body = report(repo, lock)
+    assert names(body, "violations") == []
+    assert [e["name"] for e in body["unknowns"]] == ["app"]
+
+
+def test_identifier_containing_operator_letters_still_judged():
+    """ANDOR 这类含 AND/OR 字母片段的真实标识词仍按原子标识三态判定。"""
+    repo = {
+        "app": [c("1.0", [d("x")])],
+        "x": [c("1.0", license_="ANDOR OR MIT")],
+    }
+    body = report(repo, {"app": "1.0", "x": "1.0"})
+    assert names(body, "violations") == []
+    assert [e["name"] for e in body["unknowns"]] == ["app"]
 
 
 def test_policy_overlap_422():

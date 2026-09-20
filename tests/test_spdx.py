@@ -3,7 +3,8 @@
 覆盖：AND/OR/括号的三态真值表与优先级、未知标识、括号组合、大小写规则
 （AND/OR 大小写不敏感、标识字面匹配）、尾随 "+"、LicenseRef 自定义
 引用、策略集合解析（非法标识/空项/重叠/去重），以及各类非法表达式
-（缺连接、括号不匹配、悬空运算符、WITH、非法字符、空表达式、深度上限）。
+（缺连接、括号不匹配、悬空运算符、AND/OR 两侧缺少空白分隔、WITH、
+非法字符、空表达式、深度上限）。
 """
 
 from __future__ import annotations
@@ -183,6 +184,18 @@ def test_redundant_parentheses_around_atom():
     "MIT AND OR Apache-2.0",
     "MIT AND (Apache-2.0 OR)",
     "(((MIT",
+    # AND/OR 两侧必须以空白分隔：紧贴括号或位于括号内侧一律非法
+    "MIT OR(Apache-2.0)",
+    "(MIT)AND(Apache-2.0)",
+    "(MIT)AND (Apache-2.0)",
+    "MIT AND(Apache-2.0)",
+    "(MIT OR Apache-2.0)AND MIT",
+    "MIT OR(Apache-2.0) AND MIT",
+    "MIT oR(Apache-2.0)",
+    "MIT OR(MIT)",
+    "MIT\nOR(MIT)",
+    "MIT AND (MIT OR)",
+    "(MIT AND)",
 ])
 def test_invalid_expressions_raise(expr):
     with pytest.raises(Exception):
@@ -222,6 +235,93 @@ def test_and_or_cannot_be_license_identifiers():
             parse_spdx_expression(word)
     with pytest.raises(LicenseExpressionError):
         parse_spdx_expression("MIT AND or")
+
+
+# --------------------------------------------------------------------- #
+# 5b. 回归：AND/OR 两侧必须以空白分隔（SPDX 词法规则）
+# --------------------------------------------------------------------- #
+@pytest.mark.parametrize("expr,operator", [
+    ("MIT OR(Apache-2.0)", "OR"),          # 右侧紧贴左括号
+    ("MIT AND(Apache-2.0)", "AND"),
+    ("(MIT)AND(Apache-2.0)", "AND"),       # 两侧都紧贴括号
+    ("(MIT) OR(Apache-2.0)", "OR"),
+    ("(MIT)AND (Apache-2.0)", "AND"),      # 仅左侧紧贴右括号
+    ("(MIT OR Apache-2.0)AND MIT", "AND"),
+    ("MIT oR(Apache-2.0)", "oR"),          # 大小写不敏感的运算符同样受约束
+    ("(MIT and Apache-2.0)Or(MIT)", "Or"),
+])
+def test_operator_missing_whitespace_rejected(expr, operator):
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError) as excinfo:
+        parse_spdx_expression(expr)
+    message = str(excinfo.value)
+    # 错误必须定位到具体的违规运算符及其位置，而不是笼统的语法错误
+    assert repr(operator) in message
+    assert "位置" in message and "空白" in message
+
+
+def test_first_violating_operator_is_reported():
+    """两个运算符都违规时，按扫描顺序定位到靠前的那个（OR，而非后面的 AND）。"""
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError, match=r"位置 4 处的运算符 'OR'"):
+        parse_spdx_expression("MIT OR(Apache-2.0)AND MIT")
+
+
+@pytest.mark.parametrize("expr", [
+    "MIT OR (Apache-2.0)",
+    "(MIT) AND (Apache-2.0)",
+    "(MIT OR Apache-2.0)",
+    "MIT OR  (Apache-2.0)",                # 多个空白仍合法
+    "MIT\tOR\t(Apache-2.0)",               # tab 也是空白
+    "(MIT or Apache-2.0) anD BSD-3-Clause",
+    "MIT OR\n(Apache-2.0)",
+    "((MIT OR Apache-2.0) AND (BSD-3-Clause OR MIT))",
+])
+def test_whitespace_separated_operators_still_parse(expr):
+    """合法的空白分隔、大小写混写与嵌套括号语义保持不变（不做 split 式破坏）。"""
+    node = parse_spdx_expression(expr)
+    assert node[0] in ("and", "or", "atom")
+
+
+def test_operator_precedence_preserved_after_lexer_change():
+    # AND 仍比 OR 更紧：MIT OR (GPL AND Apache)
+    assert verdict(
+        "MIT OR GPL-3.0-only AND Apache-2.0", PERMISSIVE, GPL
+    ) == ALLOW
+    assert verdict(
+        "(MIT OR Apache-2.0) AND GPL-3.0-only", PERMISSIVE, GPL
+    ) == DENY
+    # 括号分组 + 三态的既有语义不受词法改动影响
+    assert verdict("(MIT) AND (Apache-2.0)", PERMISSIVE, set()) == ALLOW
+    assert verdict("(MIT) OR (GPL-3.0-only)", PERMISSIVE, GPL) == ALLOW
+
+
+def test_operator_letter_fragments_inside_identifiers_untouched():
+    """标识词中包含 AND/OR 字母片段时仍按单个标识词处理，不能被拆分。"""
+    from app.spdx import LicenseExpressionError
+    # ANDOR 是真实存在的 SPDX 许可证标识词，必须原样作为原子
+    node = parse_spdx_expression("ANDOR")
+    assert node == ("atom", "ANDOR")
+    assert verdict("MIT AND ANDOR", {"MIT", "ANDOR"}, set()) == ALLOW
+    assert verdict("ORBIT OR MIT", {"MIT"}, set()) == ALLOW
+    # 标识符与运算符之间仍须空白：ANDOR(MIT) 是标识词紧贴括号，按既有
+    # “缺少 AND/OR 连接”规则报错（而不是把 AND 当运算符）
+    with pytest.raises(LicenseExpressionError):
+        parse_spdx_expression("ANDOR(MIT)")
+
+
+def test_dangling_operator_errors_locate_operator():
+    """表达式边界上的悬空运算符同样稳定报错并定位运算符。"""
+    from app.spdx import LicenseExpressionError
+    with pytest.raises(LicenseExpressionError, match=r"'AND'.*右侧"):
+        parse_spdx_expression("MIT AND")
+    with pytest.raises(LicenseExpressionError, match=r"位置 0 处的运算符 'OR'"):
+        parse_spdx_expression("OR MIT")
+    with pytest.raises(LicenseExpressionError, match=r"'OR'.*\)"):
+        parse_spdx_expression("MIT AND (MIT OR)")
+    # 右侧与 ')' 间有空白时由语法层拦截，仍定位到运算符
+    with pytest.raises(LicenseExpressionError, match=r"'OR'.*\)"):
+        parse_spdx_expression("MIT AND (MIT OR )")
 
 
 # --------------------------------------------------------------------- #

@@ -1241,8 +1241,16 @@ curl -s -X POST http://localhost:8000/sbom \
    - 提供文本：先按 **SPDX 表达式**解析（`AND` / `OR` / 括号，
      `OR` 优先级最低、`AND` 更高；`AND`/`OR` 大小写不敏感，标识词
      大小写敏感），再按三态规则求值；
-   - 许可证文本不是合法的 SPDX 表达式（含不支持的 `WITH` 例外表达式）
-     时返回 **422**，错误信息定位到包与版本；
+   - **`AND`/`OR` 两侧都必须以空白分隔**（SPDX 词法规则）：合法写法为
+     `MIT OR (Apache-2.0)`、`(MIT) AND (Apache-2.0)`（空格、制表符等
+     任意空白均可，多个空白也合法）；`MIT OR(Apache-2.0)`、
+     `(MIT)AND(Apache-2.0)`、`MIT AND(Apache-2.0)` 等任一侧紧贴括号或
+     表达式边界悬空（`OR MIT`、`MIT OR`）的写法都在词法/语法阶段被拒绝，
+     422 错误信息会给出违规运算符（大小写原样）与位置；标识词内部包含
+     `AND`/`OR` 字母片段（如真实标识词 `ANDOR`）仍作为单个原子标识处理，
+     不会被拆分；
+   - 许可证文本不是合法的 SPDX 表达式（含不支持的 `WITH` 例外表达式、
+     运算符两侧缺少空白分隔）时返回 **422**，错误信息定位到包与版本；
 3. 每个包的判定结果为**三态**之一：
 
    | 原子标识 / 表达式 | 结果 |
@@ -1272,6 +1280,17 @@ curl -s -X POST http://localhost:8000/sbom \
 curl -s -X POST http://localhost:8000/license-policy \
   -H 'Content-Type: application/json' \
   -d @examples/license-policy.json
+```
+
+运算符空白边界是 SPDX 词法硬性要求，下列写法均返回 **422**，消息定位到
+包/版本与违规运算符（原样大小写）及其位置，合法的空白分隔形式附后对照：
+
+```text
+422  MIT OR(Apache-2.0)     # 运算符 'OR' 缺少右侧空白分隔（位置 4）
+422  (MIT)AND(Apache-2.0)   # 运算符 'AND' 缺少左侧、右侧空白分隔（位置 5）
+422  MIT AND (MIT OR)       # 运算符 'OR' 右侧紧贴 ')'，缺少空白分隔
+ 200  MIT OR (Apache-2.0)   # 合法：两侧均有空白
+ 200  (MIT) AND (Apache-2.0)
 ```
 
 示例中策略允许 `Apache-2.0` / `BSD-3-Clause` / `MIT`、拒绝
@@ -1327,7 +1346,7 @@ curl -s -X POST http://localhost:8000/license-policy \
 | --- | --- |
 | `200` | 锁有效，策略判定完成（存在违规或未知项仍是 200；`violations` / `unknowns` 同时为空表示全部允许） |
 | `409` | 锁定清单未通过审计：`status: "invalid_lock"`，`issues` 与 `/audit-lock` 的输出一致（确定性排序），不解析许可证、不做判定 |
-| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
+| `422` | 请求/快照非法（同 `/resolve`），或 `current_lock` 含非法 PEP 440 版本、某可达包锁定版本的 `metadata.license` 不是合法 SPDX `AND`/`OR`/括号表达式（含 `WITH`、`AND`/`OR` 任一侧缺少空白分隔，如 `MIT OR(Apache-2.0)`、`(MIT)AND(Apache-2.0)`）、`allow`/`deny` 项不是单个合法 SPDX 标识、`allow` 与 `deny` 存在重叠标识 |
 
 ### `POST /lock-diff`
 
@@ -1700,9 +1719,13 @@ curl -s -X POST http://localhost:8000/explain-version \
     写不敏感、标识大小写敏感），按 allow/deny 两个标识集合做三态求值——
     标识在 deny 中为拒绝、仅在 allow 中为允许、其余未知；`AND` 全部允许
     才通过、任一拒绝即违规；`OR` 任一允许即通过、全部拒绝才违规、其余
-    未知。`violations` 与 `unknowns` 各自按包名排序，每项复用
-    第 11 条的最短路径算法附根包到该包的全部最短路径；非法 SPDX 表达式
-    （含 `WITH`）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
+    未知。词法分析保留运算符两侧必须以空白分隔的 SPDX 规则（靠记号位置
+    校验而非 split，优先级与嵌套括号不受影响）：`MIT OR(Apache-2.0)`、
+    `(MIT)AND(Apache-2.0)` 等紧贴写法稳定报 422 并在错误信息中定位违规
+    运算符与位置；标识词中的 AND/OR 字母片段（如 `ANDOR`）不被拆分。
+    `violations` 与 `unknowns` 各自按包名排序，每项复用第 11 条的最短
+    路径算法附根包到该包的全部最短路径；非法 SPDX 表达式（含 `WITH`、
+    运算符缺空白）、allow/deny 非法标识或两集合重叠返回 422，输出确定。
 16. **锁差异比较（`/lock-diff`）**：同一份快照与目标环境下提交
     before_lock / after_lock，两份锁**各自独立**复用第 10 条的审计
     （即使一份已无效仍审计另一份），任一无效即整体 409 且分别标注
